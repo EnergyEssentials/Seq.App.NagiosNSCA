@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package >
+  <metadata>
+    <id>Seq.App.NagiosNSCA</id>
+    <version>0.8.0</version>
+    <authors>Energy Essentials</authors>
+    <owners>Energy Essentials</owners>
+    <licenseUrl>http://opensource.org/licenses/MIT</licenseUrl>
+    <projectUrl>https://github.com/EnergyEssentials/Seq.App.NagiosNSCA</projectUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>Sends passive checks to Nagios using the NSCA protocol.</description>
+    <releaseNotes></releaseNotes>
+    <copyright>Energy Essentials Group B.V. 2016</copyright>
+    <tags>seq-app seq serilog event nagios monitoring</tags>
+    <dependencies>
+      <dependency id="Seq.Apps" version="1.0.2.0" />
+    </dependencies>
+  </metadata>
+  <files>
+    <file src="bin\Release\Seq.App.NagiosNSCA.dll" target="lib\net45" />
+    <file src="bin\Release\Seq.App.NagiosNSCA.pdb" target="lib\net45" />    
+    <file src="bin\Release\Nagios.NSCA.Client.dll" target="lib\net45" />
+    <file src="bin\Release\Nagios.NSCA.Client.pdb" target="lib\net45" />
+  </files>
+</package>
