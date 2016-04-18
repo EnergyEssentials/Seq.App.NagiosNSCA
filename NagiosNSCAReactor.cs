@@ -192,6 +192,11 @@ namespace Seq.App.NagiosNCSA
 
         private void AutoRecoveryTimeElapsed(object sender, ElapsedEventArgs elapsedEventArgs)
         {
+            if (DebugMode) Log.Information("The AutoRecovery timer has expired.");
+
+            var message = String.Format("It has been {0} seconds since the last log item that was not OK. Resetting status to OK.", AutoRecoveryTime);
+            SendNSCAMessage(Level.OK, message);
+
             _okTimer.Start();
         }
 
