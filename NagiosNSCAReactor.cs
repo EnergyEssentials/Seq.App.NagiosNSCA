@@ -57,10 +57,10 @@ namespace Seq.App.NagiosNCSA
         public bool ErrorIsCritical { get; set; }
 
         [SeqAppSetting(
-            DisplayName = "OK Interval",
-            HelpText = "The interval, in seconds, between sending OK messages to the endpoint. Nagios can be configured to fail if there has been no message from a passive check in x time, this option provides an OK message at the configured interval.",
+            DisplayName = "Message Interval",
+            HelpText = "The interval, in seconds, between sending messages to the endpoint. Nagios can be configured to fail if there has been no message from a passive check in x time, this option should be smaller than the freshness threshold configured for this check.",
             InputType = SettingInputType.Integer)]
-        public int OkInterval { get; set; }
+        public int MessageInterval { get; set; }
 
         [SeqAppSetting(
             DisplayName = "Nagios Level On No Event",
@@ -81,13 +81,15 @@ namespace Seq.App.NagiosNCSA
             InputType = SettingInputType.Checkbox)]
         public bool DebugMode { get; set; }
 
-        private Timer _okTimer;
-        private readonly object _okTimerLock = new object();
+        private Timer _messageIntervalTimer;
+        private readonly object _messageIntervalTimerLock = new object();
 
         private Timer _autoRecoveryTimer;
         private readonly object _autoRecoveryTimerLock = new object();
 
         private bool _eventReceivedDuringInterval = false;
+        private string _errorMessage = null;
+        private Level? _errorLevel = null;
 
         private NSCAEncryptionType _encryptionType;
         private Level _logLevelOnNoOkEvent;
@@ -96,7 +98,7 @@ namespace Seq.App.NagiosNCSA
         {
             base.OnAttached();
 
-            if (DebugMode) Log.Debug("Running OnAttach method. Trying to attach Nagios NSCA Reactor with the following settings: {NagiosEndpoint}, {NagiosEndpointPort}, {HostName}, {ServiceName}, {NSCAEncryptionType}, {HasPasswordSet}, {ErrorIsCritical}, {OKInterval}, {LogLevelOnNoOKEvent}, {AutoRecoveryTime}", NagiosEndpoint, NagiosEndpointPort, Hostname, ServiceName, NSCAEncryptionType, !String.IsNullOrWhiteSpace(NSCAPassword), ErrorIsCritical, OkInterval, LogLevelOnNoOkEvent, AutoRecoveryTime);
+            if (DebugMode) Log.Debug("Running OnAttach method. Trying to attach Nagios NSCA Reactor with the following settings: {NagiosEndpoint}, {NagiosEndpointPort}, {HostName}, {ServiceName}, {NSCAEncryptionType}, {HasPasswordSet}, {ErrorIsCritical}, {OKInterval}, {LogLevelOnNoOKEvent}, {AutoRecoveryTime}", NagiosEndpoint, NagiosEndpointPort, Hostname, ServiceName, NSCAEncryptionType, !String.IsNullOrWhiteSpace(NSCAPassword), ErrorIsCritical, MessageInterval, LogLevelOnNoOkEvent, AutoRecoveryTime);
 
             // Try to resolve the endpoint but don't actually save the result. 
             // We want to resolve the DNS for every log entry because this might be a very long lived application where a DNS change might occur
@@ -124,21 +126,26 @@ namespace Seq.App.NagiosNCSA
             else
                 if (DebugMode) Log.Information("{LogLevelOnNoOkEvent} parsed to {LogLevelOnNoOkEventParsed}", LogLevelOnNoOkEvent, _logLevelOnNoOkEvent);
 
-            if (OkInterval < 1)
+            if (MessageInterval < 1)
             {
                 throw new ArgumentException("The OK Interval should be 1 or higher");
+            }
+
+            if (AutoRecoveryTime < 1)
+            {
+                throw new ArgumentException("The AutoRecoveryTime be 1 or higher");
             }
 
             if (DebugMode) Log.Information("Sending an OK message to Nagios to indicate successful initialization");
             SendNSCAMessage(Level.OK, "Nagios NSCA Seq App is successfully initialized");
 
-            if (DebugMode) Log.Information("Starting OK Interval timer with an interval of: {OkInterval} seconds", OkInterval);
+            if (DebugMode) Log.Information("Starting OK Interval timer with an interval of: {OkInterval} seconds", MessageInterval);
 
-            lock (_okTimerLock) {
-                _okTimer = new Timer(OkInterval*1000);
-                _okTimer.Elapsed += OnOkIntervalElapse;
-                _okTimer.AutoReset = false;
-                _okTimer.Start();
+            lock (_messageIntervalTimerLock) {
+                _messageIntervalTimer = new Timer(MessageInterval*1000);
+                _messageIntervalTimer.Elapsed += OnMessageIntervalIntervalElapse;
+                _messageIntervalTimer.AutoReset = false;
+                _messageIntervalTimer.Start();
             }
 
             lock (_autoRecoveryTimerLock) {
@@ -176,27 +183,30 @@ namespace Seq.App.NagiosNCSA
         {
             if (DebugMode) Log.Information("Received an event classified as NOT OK. {EventId} - {LogLevel}", evt.Id, evt.Level);
 
-            lock (_okTimerLock)
+            lock (_messageIntervalTimerLock)
             {
-                _okTimer.Stop();
+                _messageIntervalTimer.Stop();
             }
 
             _eventReceivedDuringInterval = false;
-            var message = String.Format("{0} - [{1}] - {2}", evt.LocalTimestamp, evt.Level, evt.RenderedMessage);
+            _errorMessage = String.Format("{0} - [{1}] - {2}", evt.LocalTimestamp, evt.Level, evt.RenderedMessage);
 
-            if (evt.Level == LogEventLevel.Warning)
+            switch (evt.Level)
             {
-                SendNSCAMessage(Level.Warning, message);
+                case LogEventLevel.Warning:
+                    _errorLevel = Level.Warning;
+                    break;
+                case LogEventLevel.Error:
+                    _errorLevel = ErrorIsCritical ? Level.Critical : Level.Warning;
+                    break;
+                case LogEventLevel.Fatal:
+                    _errorLevel = Level.Critical;
+                    break;
+                default:
+                    throw new InvalidOperationException("Unexpected NOK event level: " + evt.Level);
             }
-            else if (evt.Level == LogEventLevel.Error)
-            {
-                var level = ErrorIsCritical ? Level.Critical : Level.Warning;
-                SendNSCAMessage(level, message);
-            }
-            else if (evt.Level == LogEventLevel.Fatal)
-            {
-                SendNSCAMessage(Level.Critical, message);
-            }
+
+            SendNSCAMessage(_errorLevel.Value, _errorMessage);
 
             lock (_autoRecoveryTimerLock)
             {
@@ -205,33 +215,45 @@ namespace Seq.App.NagiosNCSA
 
                 _autoRecoveryTimer.Start();
             }
+
+            lock (_messageIntervalTimerLock)
+            {
+                _messageIntervalTimer.Stop();
+            }
         }
 
-        private void OnOkIntervalElapse(object sender, ElapsedEventArgs elapsedEventArgs)
+        private void OnMessageIntervalIntervalElapse(object sender, ElapsedEventArgs elapsedEventArgs)
         {
             if (DebugMode) Log.Information("The OK interval has been triggered. Has there been an OK event? {OkTypeEventReceivedDuringInterval}", _eventReceivedDuringInterval);
 
-            lock (_okTimerLock)
+            lock (_messageIntervalTimerLock)
             {
-                _okTimer.Stop();
+                _messageIntervalTimer.Stop();
             }
 
-            if (!_eventReceivedDuringInterval)
+            if (!_errorLevel.HasValue)
             {
-                var message = String.Format("There has been no log entry in the last {0} seconds", OkInterval);
-                SendNSCAMessage(_logLevelOnNoOkEvent, message);
+                if (!_eventReceivedDuringInterval)
+                {
+                    var message = String.Format("There has been no log entry in the last {0} seconds", MessageInterval);
+                    SendNSCAMessage(_logLevelOnNoOkEvent, message);
+                }
+                else
+                {
+                    var message = String.Format("Everything OK: received log entries in the last {0} seconds", MessageInterval);
+                    SendNSCAMessage(Level.OK, message);
+                }
             }
             else
             {
-                var message = String.Format("Everything OK: received log entries in the last {0} seconds", OkInterval);
-                SendNSCAMessage(Level.OK, message);
+                SendNSCAMessage(_errorLevel.Value, _errorMessage);
             }
 
             _eventReceivedDuringInterval = false;
 
-            lock (_okTimerLock)
+            lock (_messageIntervalTimerLock)
             {
-                _okTimer.Start();
+                _messageIntervalTimer.Start();
             }
         }
 
@@ -242,8 +264,12 @@ namespace Seq.App.NagiosNCSA
             var message = String.Format("It has been {0} seconds since the last log item that was not OK. Resetting status to OK.", AutoRecoveryTime);
             SendNSCAMessage(Level.OK, message);
 
-            lock (_okTimerLock) {
-                _okTimer.Start();
+            _errorLevel = null;
+            _errorMessage = null;
+
+            lock (_messageIntervalTimerLock)
+            {
+                _messageIntervalTimer.Start();
             }
         }
 
@@ -251,10 +277,7 @@ namespace Seq.App.NagiosNCSA
         {
             NSCASettings settings = new NSCASettings()
             {
-                EncryptionType = _encryptionType,
-                NSCAAddress = Dns.GetHostAddresses(NagiosEndpoint).First().ToString(),
-                Password = NSCAPassword ?? "",
-                Port = NagiosEndpointPort
+                EncryptionType = _encryptionType, NSCAAddress = Dns.GetHostAddresses(NagiosEndpoint).First().ToString(), Password = NSCAPassword ?? "", Port = NagiosEndpointPort
             };
             if (DebugMode) Log.Information("DNS hostname lookup (just before sending a message) of {NagiosEndpoint} resolves to {DnsResult}", NagiosEndpoint, settings.NSCAAddress);
 
@@ -266,9 +289,9 @@ namespace Seq.App.NagiosNCSA
 
         public void Dispose()
         {
-            _okTimer.Stop();
-            _okTimer.Elapsed -= OnOkIntervalElapse;
-            _okTimer.Dispose();
+            _messageIntervalTimer.Stop();
+            _messageIntervalTimer.Elapsed -= OnMessageIntervalIntervalElapse;
+            _messageIntervalTimer.Dispose();
 
             _autoRecoveryTimer.Stop();
             _autoRecoveryTimer.Elapsed -= AutoRecoveryTimeElapsed;
