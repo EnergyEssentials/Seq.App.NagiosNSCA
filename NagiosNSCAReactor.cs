@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Timers;
@@ -84,12 +85,8 @@ namespace Seq.App.NagiosNCSA
         private Timer _messageIntervalTimer;
         private readonly object _messageIntervalTimerLock = new object();
 
-        private Timer _autoRecoveryTimer;
-        private readonly object _autoRecoveryTimerLock = new object();
-
         private bool _eventReceivedDuringInterval = false;
-        private string _errorMessage = null;
-        private Level? _errorLevel = null;
+        private readonly List<LogHistoryEntry> _history = new List<LogHistoryEntry>(); 
 
         private NSCAEncryptionType _encryptionType;
         private Level _logLevelOnNoOkEvent;
@@ -137,7 +134,7 @@ namespace Seq.App.NagiosNCSA
             }
 
             if (DebugMode) Log.Information("Sending an OK message to Nagios to indicate successful initialization");
-            SendNSCAMessage(Level.OK, "Nagios NSCA Seq App is successfully initialized");
+            ComposeAndSendNSCAMessage("Nagios NSCA Seq App is successfully initialized");
 
             if (DebugMode) Log.Information("Starting OK Interval timer with an interval of: {OkInterval} seconds", MessageInterval);
 
@@ -146,12 +143,6 @@ namespace Seq.App.NagiosNCSA
                 _messageIntervalTimer.Elapsed += OnMessageIntervalIntervalElapse;
                 _messageIntervalTimer.AutoReset = false;
                 _messageIntervalTimer.Start();
-            }
-
-            lock (_autoRecoveryTimerLock) {
-                _autoRecoveryTimer = new Timer(AutoRecoveryTime*1000);
-                _autoRecoveryTimer.Elapsed += AutoRecoveryTimeElapsed;
-                _autoRecoveryTimer.AutoReset = false;
             }
         }
 
@@ -189,36 +180,15 @@ namespace Seq.App.NagiosNCSA
             }
 
             _eventReceivedDuringInterval = false;
-            _errorMessage = String.Format("{0} - [{1}] - {2}", evt.LocalTimestamp, evt.Level, evt.RenderedMessage);
+            var message = String.Format("{0} - [{1}] - {2}", evt.LocalTimestamp, evt.Level, evt.RenderedMessage);
+            var expirationTicks = DateTimeOffset.Now.AddSeconds(AutoRecoveryTime).Ticks;
+            _history.Add(new LogHistoryEntry(expirationTicks, evt.Level, message));
 
-            switch (evt.Level)
-            {
-                case LogEventLevel.Warning:
-                    _errorLevel = Level.Warning;
-                    break;
-                case LogEventLevel.Error:
-                    _errorLevel = ErrorIsCritical ? Level.Critical : Level.Warning;
-                    break;
-                case LogEventLevel.Fatal:
-                    _errorLevel = Level.Critical;
-                    break;
-                default:
-                    throw new InvalidOperationException("Unexpected NOK event level: " + evt.Level);
-            }
-
-            SendNSCAMessage(_errorLevel.Value, _errorMessage);
-
-            lock (_autoRecoveryTimerLock)
-            {
-                if (_autoRecoveryTimer.Enabled)
-                    _autoRecoveryTimer.Stop();
-
-                _autoRecoveryTimer.Start();
-            }
+            ComposeAndSendNSCAMessage();
 
             lock (_messageIntervalTimerLock)
             {
-                _messageIntervalTimer.Stop();
+                _messageIntervalTimer.Start();
             }
         }
 
@@ -231,23 +201,7 @@ namespace Seq.App.NagiosNCSA
                 _messageIntervalTimer.Stop();
             }
 
-            if (!_errorLevel.HasValue)
-            {
-                if (!_eventReceivedDuringInterval)
-                {
-                    var message = String.Format("There has been no log entry in the last {0} seconds", MessageInterval);
-                    SendNSCAMessage(_logLevelOnNoOkEvent, message);
-                }
-                else
-                {
-                    var message = String.Format("Everything OK: received log entries in the last {0} seconds", MessageInterval);
-                    SendNSCAMessage(Level.OK, message);
-                }
-            }
-            else
-            {
-                SendNSCAMessage(_errorLevel.Value, _errorMessage);
-            }
+            ComposeAndSendNSCAMessage();
 
             _eventReceivedDuringInterval = false;
 
@@ -257,33 +211,77 @@ namespace Seq.App.NagiosNCSA
             }
         }
 
-        private void AutoRecoveryTimeElapsed(object sender, ElapsedEventArgs elapsedEventArgs)
+        //private void AutoRecoveryTimeElapsed(object sender, ElapsedEventArgs elapsedEventArgs)
+        //{
+        //    if (DebugMode) Log.Information("The AutoRecovery timer has expired.");
+
+        //    lock (_messageIntervalTimerLock)
+        //    {
+        //        _messageIntervalTimer.Stop();
+        //    }
+
+        //    ComposeAndSendNSCAMessage(String.Format("It has been {0} seconds since the last log item that was not OK. Resetting status to OK.", AutoRecoveryTime));
+
+        //    _errorLevel = null;
+        //    _errorMessage = null;
+
+        //    lock (_messageIntervalTimerLock)
+        //    {
+        //        _messageIntervalTimer.Start();
+        //    }
+        //}
+
+        private void ComposeAndSendNSCAMessage(string optionalOkMessageOverride = null)
         {
-            if (DebugMode) Log.Information("The AutoRecovery timer has expired.");
+            Level level = Level.Unknown;
+            string message;
 
-            var message = String.Format("It has been {0} seconds since the last log item that was not OK. Resetting status to OK.", AutoRecoveryTime);
-            SendNSCAMessage(Level.OK, message);
+            _history.RemoveAll(x => x.ExpirationTicks <= DateTimeOffset.Now.Ticks);
 
-            _errorLevel = null;
-            _errorMessage = null;
+            var worstLogEntry = _history
+                .OrderByDescending(x => x.SeqLogLevel) // Worst log level
+                .ThenByDescending(x => x.ExpirationTicks) // Last entry of the worst log level availible
+                .FirstOrDefault();
 
-            lock (_messageIntervalTimerLock)
+            if (worstLogEntry != null)
             {
-                _messageIntervalTimer.Start();
-            }
-        }
+                message = worstLogEntry.Message;
 
-        private void SendNSCAMessage(Level level, string message)
-        {
+                if (worstLogEntry.SeqLogLevel == LogEventLevel.Fatal || (ErrorIsCritical && worstLogEntry.SeqLogLevel == LogEventLevel.Error))
+                {
+                    level = Level.Critical;
+                }
+                else
+                {
+                    level = Level.Warning;
+                }
+            }
+            else
+            {
+                if (!_eventReceivedDuringInterval)
+                {
+                    message = optionalOkMessageOverride ?? String.Format("There has been no log entry in the last {0} seconds", MessageInterval);
+                    level = _logLevelOnNoOkEvent;
+                }
+                else
+                {
+                    message = optionalOkMessageOverride ?? String.Format("Received log entries in the last {0} seconds", MessageInterval);
+                    level = Level.OK;
+                }
+            }
+
+            if (DebugMode) Log.Information("Message send with level: {NagiosLevel} and message: {NagiosMessage}", level, message);
+
             NSCASettings settings = new NSCASettings()
             {
-                EncryptionType = _encryptionType, NSCAAddress = Dns.GetHostAddresses(NagiosEndpoint).First().ToString(), Password = NSCAPassword ?? "", Port = NagiosEndpointPort
+                EncryptionType = _encryptionType,
+                NSCAAddress = Dns.GetHostAddresses(NagiosEndpoint).First().ToString(),
+                Password = NSCAPassword ?? "",
+                Port = NagiosEndpointPort
             };
             if (DebugMode) Log.Information("DNS hostname lookup (just before sending a message) of {NagiosEndpoint} resolves to {DnsResult}", NagiosEndpoint, settings.NSCAAddress);
 
             var client = new NSCAClientSender(settings);
-
-            if (DebugMode) Log.Information("Message send with level: {NagiosLevel} and message: {NagiosMessage}", level, message);
             client.SendPassiveCheck(level, Hostname, ServiceName, message);
         }
 
@@ -292,10 +290,20 @@ namespace Seq.App.NagiosNCSA
             _messageIntervalTimer.Stop();
             _messageIntervalTimer.Elapsed -= OnMessageIntervalIntervalElapse;
             _messageIntervalTimer.Dispose();
+        }
 
-            _autoRecoveryTimer.Stop();
-            _autoRecoveryTimer.Elapsed -= AutoRecoveryTimeElapsed;
-            _autoRecoveryTimer.Dispose();
+        private class LogHistoryEntry
+        {
+            public LogHistoryEntry(long expirationTicks, LogEventLevel seqLogLevel, string message)
+            {
+                ExpirationTicks = expirationTicks;
+                SeqLogLevel = seqLogLevel;
+                Message = message;
+            }
+
+            public long ExpirationTicks { get; private set; }
+            public LogEventLevel SeqLogLevel { get; private set; }
+            public string Message { get; private set; }
         }
     }
 }
