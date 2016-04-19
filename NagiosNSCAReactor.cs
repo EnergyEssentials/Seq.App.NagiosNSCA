@@ -85,8 +85,10 @@ namespace Seq.App.NagiosNCSA
         private Timer _messageIntervalTimer;
         private readonly object _messageIntervalTimerLock = new object();
 
+        private readonly List<LogHistoryEntry> _history = new List<LogHistoryEntry>();
+        private readonly object _historyListLock = new object();
+
         private bool _eventReceivedDuringInterval = false;
-        private readonly List<LogHistoryEntry> _history = new List<LogHistoryEntry>(); 
 
         private NSCAEncryptionType _encryptionType;
         private Level _logLevelOnNoOkEvent;
@@ -182,7 +184,10 @@ namespace Seq.App.NagiosNCSA
             _eventReceivedDuringInterval = false;
             var message = String.Format("{0} - [{1}] - {2}", evt.LocalTimestamp, evt.Level, evt.RenderedMessage);
             var expirationTicks = DateTimeOffset.Now.AddSeconds(AutoRecoveryTime).Ticks;
-            _history.Add(new LogHistoryEntry(expirationTicks, evt.Level, message));
+            lock (_historyListLock)
+            {
+                _history.Add(new LogHistoryEntry(expirationTicks, evt.Level, message));
+            }
 
             ComposeAndSendNSCAMessage();
 
@@ -237,21 +242,26 @@ namespace Seq.App.NagiosNCSA
             string message;
             var ticksNow = DateTimeOffset.Now.Ticks;
 
-            if (DebugMode)
+            LogHistoryEntry worstLogEntry;
+            lock (_historyListLock)
             {
-                Log.Information("Now: {ticks}, Number of events in history: {EventsInHistory}. Events that will be deleted this run: {RemoveEventCount}, First expiry ticks in history: {expiryticks}",
-                    ticksNow,
-                    _history.Count,
-                    _history.Count(x => x.ExpirationTicks <= ticksNow),
-                    _history.Any() ? _history.Min(x => x.ExpirationTicks).ToString() : "-none-");
+
+                if (DebugMode)
+                {
+                    Log.Information("Now: {ticks}, Number of events in history: {EventsInHistory}. Events that will be deleted this run: {RemoveEventCount}, First expiry ticks in history: {expiryticks}",
+                        ticksNow,
+                        _history.Count,
+                        _history.Count(x => x.ExpirationTicks <= ticksNow),
+                        _history.Any() ? _history.Min(x => x.ExpirationTicks).ToString() : "-none-");
+                }
+
+                _history.RemoveAll(x => x.ExpirationTicks <= ticksNow);
+
+                worstLogEntry = _history
+                    .OrderByDescending(x => x.SeqLogLevel) // Worst log level
+                    .ThenByDescending(x => x.ExpirationTicks) // Last entry of the worst log level availible
+                    .FirstOrDefault();
             }
-
-            _history.RemoveAll(x => x.ExpirationTicks <= ticksNow);
-
-            var worstLogEntry = _history
-                .OrderByDescending(x => x.SeqLogLevel) // Worst log level
-                .ThenByDescending(x => x.ExpirationTicks) // Last entry of the worst log level availible
-                .FirstOrDefault();
 
             if (worstLogEntry != null)
             {
