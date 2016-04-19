@@ -1,4 +1,4 @@
-# Seq.App.NagiosNSCA
+# Seq.App.NagiosNSCA [![Build status](https://ci.appveyor.com/api/projects/status/bd9lg37vskj6x00j/branch/master?svg=true)](https://ci.appveyor.com/project/yoricksmeets/seq-app-nagiosnsca/branch/master)
 
 Seq App: Sends passive checks to Nagios using the NSCA protocol
 
