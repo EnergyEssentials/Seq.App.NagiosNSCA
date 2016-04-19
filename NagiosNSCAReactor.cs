@@ -235,8 +235,18 @@ namespace Seq.App.NagiosNCSA
         {
             Level level = Level.Unknown;
             string message;
+            var ticksNow = DateTimeOffset.Now.Ticks;
 
-            _history.RemoveAll(x => x.ExpirationTicks <= DateTimeOffset.Now.Ticks);
+            if (DebugMode)
+            {
+                Log.Information("Now: {ticks}, Number of events in history: {EventsInHistory}. Events that will be deleted this run: {RemoveEventCount}, First expiry ticks in history: {expiryticks}",
+                    ticksNow,
+                    _history.Count,
+                    _history.Count(x => x.ExpirationTicks <= ticksNow),
+                    _history.Any() ? _history.Min(x => x.ExpirationTicks).ToString() : "-none-");
+            }
+
+            _history.RemoveAll(x => x.ExpirationTicks <= ticksNow);
 
             var worstLogEntry = _history
                 .OrderByDescending(x => x.SeqLogLevel) // Worst log level
@@ -245,6 +255,8 @@ namespace Seq.App.NagiosNCSA
 
             if (worstLogEntry != null)
             {
+                if (DebugMode) Log.Information("Last event of the worst level in history: {ExpiryTicks}, {LogLevel}, {Message}", worstLogEntry.ExpirationTicks, worstLogEntry.SeqLogLevel, worstLogEntry.Message);
+
                 message = worstLogEntry.Message;
 
                 if (worstLogEntry.SeqLogLevel == LogEventLevel.Fatal || (ErrorIsCritical && worstLogEntry.SeqLogLevel == LogEventLevel.Error))
